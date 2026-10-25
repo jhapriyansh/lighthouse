@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,6 +51,7 @@ const (
 	fHeaders
 	fBody
 	fResponse
+	fFile
 	fCount
 )
 
@@ -71,10 +73,14 @@ type theme struct {
 }
 
 var themes = []theme{
-	{"btop", "#00D7FF", "#5F8787", "#00D787", "#FFD75F", "#FF5F5F", "#5FAFFF", "#AF87FF", "#00D7D7", "#AFAFAF", "#101820", "#D7E3E3", "#1D3030"},
+	{"ocean", "#00B8D9", "#5F7A81", "#4FD1A1", "#FFD166", "#FF6B6B", "#64B5F6", "#B388FF", "#2DD4BF", "#B0BEC5", "#101820", "#E6F4F1", "#193036"},
 	{"violet", "#7D56F4", "#626262", "#04B575", "#E5C07B", "#FF5F87", "#61AFEF", "#C678DD", "#56B6C2", "#9E9E9E", "#1A1A1A", "#E4E4E4", "#2E2E42"},
 	{"nord", "#88C0D0", "#616E88", "#A3BE8C", "#EBCB8B", "#BF616A", "#81A1C1", "#B48EAD", "#8FBCBB", "#D8DEE9", "#2E3440", "#ECEFF4", "#3B4252"},
 	{"amber", "#FFB454", "#6C7380", "#AAD94C", "#FFD173", "#F07178", "#59C2FF", "#D2A6FF", "#95E6CB", "#B3B1AD", "#0D1017", "#E6E1CF", "#1B202B"},
+	{"carbon", "#7DD3FC", "#737373", "#86EFAC", "#FDE68A", "#FDA4AF", "#93C5FD", "#D8B4FE", "#67E8F9", "#D4D4D4", "#111111", "#F5F5F5", "#262626"},
+	{"paper", "#006D8F", "#64748B", "#177245", "#9A6700", "#B42318", "#175CD3", "#7A3E9D", "#007C91", "#475569", "#102A43", "#102A43", "#F1F5F9"},
+	{"mist", "#5B5BD6", "#64748B", "#15803D", "#A16207", "#B91C1C", "#2563EB", "#9333EA", "#0F766E", "#475569", "#1E293B", "#1E293B", "#E8EDF5"},
+	{"solar", "#B45309", "#78716C", "#3F6212", "#A16207", "#BE123C", "#1D4ED8", "#7E22CE", "#0F766E", "#57534E", "#292524", "#292524", "#FFFBEB"},
 }
 
 var (
@@ -197,8 +203,8 @@ type geometry struct {
 
 	toolbar []btn // row 0, right-aligned
 
-	selPrev, selName, selNext rect // method selector
-	urlBar, urlIn, send       rect
+	selPrev, selName, selNext   rect // method selector
+	urlBar, urlIn, fileIn, send rect
 
 	headers, body, resp rect // full layout panes
 	pane                rect // compact layout: the single visible pane
@@ -269,16 +275,18 @@ func (m model) geo() geometry {
 
 	// Request bar: rows 1-3, content on row 2, starting at column 2.
 	inW := W - 25
-	g.urlBar = rect{0, 1, W, 3}
-	g.selPrev = rect{2, 2, 3, 1}
-	g.selName = rect{5, 2, 5, 1}
-	g.selNext = rect{10, 2, 3, 1}
+	g.urlBar = rect{0, 1, W, 4}
+	// These rects match the rendered selector exactly: ◂ + space + 7-cell pill + space + ▸.
+	g.selPrev = rect{2, 2, 2, 1}
+	g.selName = rect{4, 2, 7, 1}
+	g.selNext = rect{11, 2, 2, 1}
 	g.urlIn = rect{14, 2, inW, 1}
 	g.send = rect{14 + inW + 1, 2, sendW, 1}
+	g.fileIn = rect{14, 3, W - 16, 1}
 
 	// Body area: rows 4 .. H-2. Row H-1 is the status line.
-	top := 4
-	avail := H - 5
+	top := 5
+	avail := H - 6
 	if !g.compact {
 		leftW := W / 2
 		rightW := W - leftW
@@ -346,6 +354,7 @@ type entry struct {
 	URL     string    `json:"url"`
 	Headers string    `json:"headers"`
 	Body    string    `json:"body"`
+	File    string    `json:"file,omitempty"`
 	Pinned  bool      `json:"pinned,omitempty"`
 	Time    time.Time `json:"time"`
 }
@@ -360,7 +369,7 @@ type project struct {
 }
 
 func (e entry) key() string {
-	return e.Method + "\x00" + e.URL + "\x00" + e.Headers + "\x00" + e.Body
+	return e.Method + "\x00" + e.URL + "\x00" + e.Headers + "\x00" + e.Body + "\x00" + e.File
 }
 
 func indexOfKey(list []entry, k string) int {
@@ -510,10 +519,12 @@ func saveProjects(list []project) error {
 // ───────────────────────────── request building ─────────────────────────────
 
 type reqSpec struct {
-	Method string
-	URL    string
-	Header http.Header
-	Body   string
+	Method    string
+	URL       string
+	Header    http.Header
+	Body      string
+	FileField string
+	FilePath  string
 }
 
 var varRe = regexp.MustCompile(`\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}`)
@@ -567,6 +578,34 @@ func parseHeaders(raw string) http.Header {
 	return h
 }
 
+var commonHeaders = []string{
+	"Accept", "Accept-Encoding", "Accept-Language", "Authorization", "Cache-Control",
+	"Content-Type", "Cookie", "If-None-Match", "Origin", "Referer", "User-Agent", "X-API-Key", "X-Request-ID",
+}
+
+// cleanPaste removes invisible transport characters and converts typography
+// commonly introduced by rich-text sources into forms HTTP and JSON accept.
+func cleanPaste(s string) string {
+	r := strings.NewReplacer("\r\n", "\n", "\r", "\n", "\u00a0", " ", "\u200b", "", "\u201c", `"`, "\u201d", `"`, "\u2018", "'", "\u2019", "'")
+	return r.Replace(s)
+}
+
+func (m model) completeHeader() (model, tea.Cmd) {
+	raw := m.headers.Value()
+	start := strings.LastIndex(raw, "\n") + 1
+	prefix := strings.TrimSpace(raw[start:])
+	if prefix == "" || strings.Contains(prefix, ":") {
+		return m.notify("start typing a header name first", true)
+	}
+	for _, h := range commonHeaders {
+		if strings.HasPrefix(strings.ToLower(h), strings.ToLower(prefix)) {
+			m.headers.SetValue(raw[:start] + h + ": ")
+			return m.notify("completed "+h, false)
+		}
+	}
+	return m.notify("no header suggestion", true)
+}
+
 func uniq(s []string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -585,6 +624,7 @@ func (m model) currentEntry() entry {
 		URL:     strings.TrimSpace(m.url.Value()),
 		Headers: m.headers.Value(),
 		Body:    m.body.Value(),
+		File:    m.file.Value(),
 		Time:    time.Now(),
 	}
 }
@@ -601,7 +641,7 @@ func (m model) spec() (reqSpec, error) {
 	if raw == "" {
 		return reqSpec{}, errors.New("enter a URL first")
 	}
-	target, hdrs, body := ex(raw), ex(m.headers.Value()), ex(m.body.Value())
+	target, hdrs, body, file := ex(raw), ex(m.headers.Value()), ex(m.body.Value()), ex(m.file.Value())
 	if len(missing) > 0 {
 		return reqSpec{}, fmt.Errorf("undefined variable: %s", strings.Join(uniq(missing), ", "))
 	}
@@ -615,14 +655,24 @@ func (m model) spec() (reqSpec, error) {
 	if method == "GET" || method == "HEAD" {
 		body = ""
 	}
-	if body != "" && h.Get("Content-Type") == "" {
+	fileField, filePath := "", ""
+	if strings.TrimSpace(file) != "" {
+		fileField, filePath, _ = strings.Cut(strings.TrimSpace(file), "=@")
+		if filePath == "" || strings.TrimSpace(fileField) == "" {
+			return reqSpec{}, errors.New("file format: field=@/path/to/file")
+		}
+		if info, err := os.Stat(filePath); err != nil || info.IsDir() {
+			return reqSpec{}, fmt.Errorf("file unavailable: %s", filePath)
+		}
+	}
+	if body != "" && filePath == "" && h.Get("Content-Type") == "" {
 		if json.Valid([]byte(body)) {
 			h.Set("Content-Type", "application/json")
 		} else {
 			h.Set("Content-Type", "text/plain; charset=utf-8")
 		}
 	}
-	return reqSpec{Method: method, URL: target, Header: h, Body: body}, nil
+	return reqSpec{Method: method, URL: target, Header: h, Body: body, FileField: fileField, FilePath: filePath}, nil
 }
 
 func shellQuote(s string) string {
@@ -650,6 +700,9 @@ func curlCommand(s reqSpec) string {
 	if s.Body != "" {
 		parts = append(parts, "--data-raw "+shellQuote(s.Body))
 	}
+	if s.FilePath != "" {
+		parts = append(parts, "-F "+shellQuote(s.FileField+"=@"+s.FilePath))
+	}
 	return strings.Join(parts, " \\\n  ")
 }
 
@@ -675,7 +728,34 @@ func doRequest(ctx context.Context, s reqSpec) tea.Cmd {
 		}
 
 		var rdr io.Reader
-		if s.Body != "" {
+		contentType := ""
+		if s.FilePath != "" {
+			var form bytes.Buffer
+			mw := multipart.NewWriter(&form)
+			if s.Body != "" {
+				_ = mw.WriteField("payload", s.Body)
+			}
+			part, err := mw.CreateFormFile(s.FileField, filepath.Base(s.FilePath))
+			if err != nil {
+				return fail(err)
+			}
+			f, err := os.Open(s.FilePath)
+			if err != nil {
+				return fail(err)
+			}
+			_, copyErr := io.Copy(part, f)
+			closeErr := f.Close()
+			if copyErr != nil {
+				return fail(copyErr)
+			}
+			if closeErr != nil {
+				return fail(closeErr)
+			}
+			if err := mw.Close(); err != nil {
+				return fail(err)
+			}
+			rdr, contentType = &form, mw.FormDataContentType()
+		} else if s.Body != "" {
 			rdr = strings.NewReader(s.Body)
 		}
 		req, err := http.NewRequestWithContext(ctx, s.Method, s.URL, rdr)
@@ -683,6 +763,9 @@ func doRequest(ctx context.Context, s reqSpec) tea.Cmd {
 			return fail(err)
 		}
 		req.Header = s.Header.Clone()
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
 		if req.Header.Get("User-Agent") == "" {
 			req.Header.Set("User-Agent", "lh/1.0")
 		}
@@ -720,6 +803,7 @@ type model struct {
 	compactPane int // which pane the compact layout shows when URL/method has focus
 
 	url     textinput.Model
+	file    textinput.Model
 	headers textarea.Model
 	body    textarea.Model
 	view    viewport.Model
@@ -754,6 +838,10 @@ func initialModel() model {
 	u.Placeholder = "https://httpbin.org/get   (try {{NAME}} for env variables)"
 	u.CharLimit = 4096
 	u.Prompt = ""
+	f := textinput.New()
+	f.Placeholder = "optional upload: field=@/absolute/path/to/file"
+	f.CharLimit = 4096
+	f.Prompt = ""
 
 	h := textarea.New()
 	h.Placeholder = "Header-Name: value"
@@ -779,6 +867,7 @@ func initialModel() model {
 		focus:         fURL,
 		compactPane:   fResponse,
 		url:           u,
+		file:          f,
 		headers:       h,
 		body:          b,
 		view:          vp,
@@ -793,6 +882,7 @@ func initialModel() model {
 // applyFocus makes exactly one input live (cursor, receives keys).
 func (m model) applyFocus() model {
 	m.url.Blur()
+	m.file.Blur()
 	m.headers.Blur()
 	m.body.Blur()
 	switch m.focus {
@@ -806,6 +896,8 @@ func (m model) applyFocus() model {
 		m.compactPane = fBody
 	case fResponse:
 		m.compactPane = fResponse
+	case fFile:
+		m.file.Focus()
 	}
 	return m
 }
@@ -817,6 +909,8 @@ func (m model) layout() model {
 		return m
 	}
 	m.url.Width = max(g.urlIn.w-1, 1)
+	m.file.Width = max(g.fileIn.w-1, 1)
+	m.file.SetCursor(m.file.Position())
 	m.url.SetCursor(m.url.Position()) // re-scroll so the cursor stays visible
 	m.headers.SetWidth(max(g.taW, 10))
 	m.headers.SetHeight(max(g.headersH, 1))
@@ -920,6 +1014,7 @@ func (m model) loadEntry(e entry) model {
 	m.url.SetValue(e.URL)
 	m.headers.SetValue(e.Headers)
 	m.body.SetValue(e.Body)
+	m.file.SetValue(e.File)
 	m.focus = fURL
 	return m.applyFocus()
 }
@@ -1219,12 +1314,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.focus {
 	case fURL:
 		m.url, cmd = m.url.Update(msg)
+		if clean := cleanPaste(m.url.Value()); clean != m.url.Value() {
+			m.url.SetValue(clean)
+		}
 	case fHeaders:
 		m.headers, cmd = m.headers.Update(msg)
+		if clean := cleanPaste(m.headers.Value()); clean != m.headers.Value() {
+			m.headers.SetValue(clean)
+		}
 	case fBody:
 		m.body, cmd = m.body.Update(msg)
+		if clean := cleanPaste(m.body.Value()); clean != m.body.Value() {
+			m.body.SetValue(clean)
+		}
 	case fResponse:
 		m.view, cmd = m.view.Update(msg)
+	case fFile:
+		m.file, cmd = m.file.Update(msg)
+		if clean := cleanPaste(m.file.Value()); clean != m.file.Value() {
+			m.file.SetValue(clean)
+		}
 	}
 	return m, cmd
 }
@@ -1262,6 +1371,11 @@ func (m model) globalKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 	case "f10":
 		nm, c := m.do("panes")
 		return nm, c, true
+	case "ctrl+space":
+		if m.focus == fHeaders {
+			nm, c := m.completeHeader()
+			return nm, c, true
+		}
 	case "f3":
 		nm, c := m.do("pin")
 		return nm, c, true
@@ -1492,6 +1606,11 @@ func (m model) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m = m.applyFocus()
 		m.url.SetCursor(x - g.urlIn.x)
 		return m, nil
+	case g.fileIn.in(x, y):
+		m.focus = fFile
+		m = m.applyFocus()
+		m.file.SetCursor(x - g.fileIn.x)
+		return m, nil
 	case g.urlBar.in(x, y):
 		m.focus = fURL
 		return m.applyFocus(), nil
@@ -1667,7 +1786,7 @@ func (m model) View() string {
 	return lipgloss.NewStyle().MaxWidth(m.width).MaxHeight(m.height).Render(out)
 }
 
-// tooSmallView mimics btop: show the current and required size.
+// tooSmallView centers the current and required terminal size.
 func tooSmallView(w, h int) string {
 	cur := func(v, need int) string {
 		if v < need {
@@ -1734,7 +1853,8 @@ func (m model) renderURLBar(g geometry) string {
 	}
 	line := selector(methods[m.method], m.focus == fMethod) + " " +
 		fit(m.url.View(), g.urlIn.w) + " " + send
-	return box(m.focus == fMethod || m.focus == fURL, g.W-2).Render(line)
+	file := dimStyle.Render("  Upload    ") + fit(m.file.View(), g.fileIn.w)
+	return box(m.focus == fMethod || m.focus == fURL || m.focus == fFile, g.W-2).Render(line + "\n" + file)
 }
 
 // paneBox draws a bordered pane of exactly r.w x r.h cells.
@@ -1794,12 +1914,12 @@ func (m model) renderBody(g geometry) string {
 		}
 		if m.paneMode == 2 {
 			headers := paneBox(g.headers, m.focus == fHeaders,
-				titleStyle.Render("Headers")+dimStyle.Render("  Name: value, one per line"), m.headers.View())
+				titleStyle.Render("Headers")+dimStyle.Render("  Ctrl+Space completes names · safe paste"), m.headers.View())
 			body := paneBox(g.body, m.focus == fBody, bodyTitle, m.body.View())
 			return lipgloss.JoinVertical(lipgloss.Left, headers, body)
 		}
 		headers := paneBox(g.headers, m.focus == fHeaders,
-			titleStyle.Render("Headers")+dimStyle.Render("  Name: value, one per line"), m.headers.View())
+			titleStyle.Render("Headers")+dimStyle.Render("  Ctrl+Space completes names · safe paste"), m.headers.View())
 		body := paneBox(g.body, m.focus == fBody, bodyTitle, m.body.View())
 		left := lipgloss.JoinVertical(lipgloss.Left, headers, body)
 
@@ -1854,6 +1974,7 @@ var helpLines = []string{
 	"tab / shift+tab   next / previous pane",
 	"enter (URL bar)   send · F5 / ctrl+r also send",
 	"ctrl+enter        send from any editor pane",
+	"Upload field      field=@/absolute/path sends multipart/form-data",
 	"esc               cancel a running request",
 	"← →  (method)     change method",
 	"F8 / ctrl+t       response body ⇆ headers",
@@ -1865,6 +1986,7 @@ var helpLines = []string{
 	"F10               cycle split / response / request panes",
 	"ctrl+p            projects (n new · s save · enter open)",
 	"ctrl+g            theme picker",
+	"ctrl+space        complete a header name (Headers editor)",
 	"ctrl+q            quit",
 	"",
 	titleStyle.Render("Mouse"),
