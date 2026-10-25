@@ -1,0 +1,32 @@
+# Built binary (the leading / means only the one in the repo root)
+/lh
+/lh.exe
+/bin/
+/dist/
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+*.prof
+
+# Test coverage
+coverage.txt
+coverage.html
+
+# Go workspace file (local only)
+go.work
+go.work.sum
+
+# Secrets and local config (you'll likely save auth tokens later)
+.env
+.env.*
+*.pem
+*.key
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
