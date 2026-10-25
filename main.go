@@ -58,11 +58,24 @@ const (
 	ovNone = iota
 	ovHistory
 	ovHelp
+	ovProjects
+	ovThemes
 )
 
 var methods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 
 // ───────────────────────────── theme ─────────────────────────────
+
+type theme struct {
+	name, accent, dim, green, yellow, red, blue, purple, cyan, gray, dark, text, panel string
+}
+
+var themes = []theme{
+	{"btop", "#00D7FF", "#5F8787", "#00D787", "#FFD75F", "#FF5F5F", "#5FAFFF", "#AF87FF", "#00D7D7", "#AFAFAF", "#101820", "#D7E3E3", "#1D3030"},
+	{"violet", "#7D56F4", "#626262", "#04B575", "#E5C07B", "#FF5F87", "#61AFEF", "#C678DD", "#56B6C2", "#9E9E9E", "#1A1A1A", "#E4E4E4", "#2E2E42"},
+	{"nord", "#88C0D0", "#616E88", "#A3BE8C", "#EBCB8B", "#BF616A", "#81A1C1", "#B48EAD", "#8FBCBB", "#D8DEE9", "#2E3440", "#ECEFF4", "#3B4252"},
+	{"amber", "#FFB454", "#6C7380", "#AAD94C", "#FFD173", "#F07178", "#59C2FF", "#D2A6FF", "#95E6CB", "#B3B1AD", "#0D1017", "#E6E1CF", "#1B202B"},
+}
 
 var (
 	colAccent = lipgloss.Color("#7D56F4")
@@ -100,6 +113,20 @@ var (
 	jsonNum = lipgloss.NewStyle().Foreground(colYellow)
 	jsonLit = lipgloss.NewStyle().Foreground(colPurple)
 )
+
+// applyTheme updates the small set of shared styles in one place. Keeping
+// colors data-driven makes palettes feel native rather than like a skin.
+func applyTheme(t theme) {
+	colAccent, colDim, colGreen = lipgloss.Color(t.accent), lipgloss.Color(t.dim), lipgloss.Color(t.green)
+	colYellow, colRed, colBlue = lipgloss.Color(t.yellow), lipgloss.Color(t.red), lipgloss.Color(t.blue)
+	colPurple, colCyan, colGray = lipgloss.Color(t.purple), lipgloss.Color(t.cyan), lipgloss.Color(t.gray)
+	colDark, colText, colPanel = lipgloss.Color(t.dark), lipgloss.Color(t.text), lipgloss.Color(t.panel)
+	methodColors = map[string]lipgloss.Color{"GET": colGreen, "POST": colYellow, "PUT": colBlue, "PATCH": colPurple, "DELETE": colRed, "HEAD": colCyan, "OPTIONS": colGray}
+	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(colAccent)
+	dimStyle, errStyle, okStyle = lipgloss.NewStyle().Foreground(colDim), lipgloss.NewStyle().Foreground(colRed), lipgloss.NewStyle().Foreground(colGreen)
+	jsonKey, jsonStr = lipgloss.NewStyle().Foreground(colBlue), lipgloss.NewStyle().Foreground(colGreen)
+	jsonNum, jsonLit = lipgloss.NewStyle().Foreground(colYellow), lipgloss.NewStyle().Foreground(colPurple)
+}
 
 // box draws a rounded border (purple when focused). In lipgloss, Width
 // includes the padding but not the border.
@@ -190,6 +217,9 @@ type geometry struct {
 type toolDef struct{ id, long, short string }
 
 var toolDefs = []toolDef{
+	{"projects", "Projects", "Proj"},
+	{"themes", "Theme", "Theme"},
+	{"panes", "Panes", "Pane"},
 	{"hist", "History", "Hist"},
 	{"pin", "Pin", "Pin"},
 	{"copy", "Copy", "Cp"},
@@ -216,10 +246,14 @@ func (m model) geo() geometry {
 	g.compact = W < fullW || H < fullH
 
 	// Toolbar: right-aligned buttons on row 0.
-	useLong := W >= 70
-	labels := make([]string, len(toolDefs))
-	total := len(toolDefs) - 1
-	for i, d := range toolDefs {
+	useLong := W >= 110
+	defs := toolDefs
+	if W < 70 {
+		defs = []toolDef{toolDefs[0], toolDefs[2], toolDefs[3], toolDefs[len(toolDefs)-1]}
+	}
+	labels := make([]string, len(defs))
+	total := len(defs) - 1
+	for i, d := range defs {
 		labels[i] = d.short
 		if useLong {
 			labels[i] = d.long
@@ -227,7 +261,7 @@ func (m model) geo() geometry {
 		total += lipgloss.Width(labels[i]) + 2
 	}
 	x := W - total
-	for i, d := range toolDefs {
+	for i, d := range defs {
 		w := lipgloss.Width(labels[i]) + 2
 		g.toolbar = append(g.toolbar, btn{d.id, labels[i], rect{x, 0, w, 1}})
 		x += w + 1
@@ -248,14 +282,20 @@ func (m model) geo() geometry {
 	if !g.compact {
 		leftW := W / 2
 		rightW := W - leftW
+		if m.paneMode == 1 {
+			leftW, rightW = 0, W
+		}
+		if m.paneMode == 2 {
+			leftW, rightW = W, 0
+		}
 		hH := avail / 3
 		g.headers = rect{0, top, leftW, hH}
 		g.body = rect{0, top + hH, leftW, avail - hH}
 		g.resp = rect{leftW, top, rightW, avail}
-		g.taW = leftW - 4
+		g.taW = max(leftW-4, 10)
 		g.headersH = hH - 3 // border (2) + title row (1)
 		g.bodyH = avail - hH - 3
-		g.vpW = rightW - 4
+		g.vpW = max(rightW-4, 10)
 		g.vpH = avail - 3
 		tx := g.resp.x + 2
 		g.tabs = []btn{
@@ -279,8 +319,15 @@ func (m model) geo() geometry {
 	// Overlay modal.
 	bw := min(W-4, 90)
 	switch m.overlay {
-	case ovHistory:
-		vis := min(max(len(m.hist), 1), H-2-7)
+	case ovHistory, ovProjects, ovThemes:
+		count := len(m.hist)
+		if m.overlay == ovProjects {
+			count = len(m.projects)
+		}
+		if m.overlay == ovThemes {
+			count = len(themes)
+		}
+		vis := min(max(count, 1), H-2-7)
 		mh := vis + 7
 		g.visible = vis
 		g.modal = rect{(W - bw) / 2, 1 + (H-2-mh)/2, bw, mh}
@@ -301,6 +348,15 @@ type entry struct {
 	Body    string    `json:"body"`
 	Pinned  bool      `json:"pinned,omitempty"`
 	Time    time.Time `json:"time"`
+}
+
+// A project is a tiny, portable collection: it keeps request definitions but
+// never expanded environment values or responses. It is deliberately separate
+// from history, which remains a chronological global activity log.
+type project struct {
+	Name     string    `json:"name"`
+	Requests []entry   `json:"requests"`
+	Updated  time.Time `json:"updated"`
 }
 
 func (e entry) key() string {
@@ -388,6 +444,52 @@ func loadHistory() []entry {
 
 func saveHistory(list []entry) error {
 	p, err := historyPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p)
+}
+
+func projectsPath() (string, error) {
+	if p := os.Getenv("LH_PROJECTS_FILE"); p != "" {
+		return p, nil
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "lh", "projects.json"), nil
+}
+
+func loadProjects() []project {
+	p, err := projectsPath()
+	if err != nil {
+		return nil
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var list []project
+	if json.Unmarshal(b, &list) != nil {
+		return nil
+	}
+	return list
+}
+
+func saveProjects(list []project) error {
+	p, err := projectsPath()
 	if err != nil {
 		return err
 	}
@@ -628,10 +730,16 @@ type model struct {
 	cancel      context.CancelFunc
 	showHeaders bool // response pane: body or headers
 
-	overlay int
-	hist    []entry
-	histSel int
-	histTop int
+	overlay       int
+	hist          []entry
+	histSel       int
+	histTop       int
+	projects      []project
+	projectSel    int
+	projectTop    int
+	activeProject int // -1 is the unsaved scratchpad
+	themeSel      int
+	paneMode      int // 0 split, 1 response focus, 2 request focus (full layout)
 
 	toast    string
 	toastErr bool
@@ -641,6 +749,7 @@ type model struct {
 }
 
 func initialModel() model {
+	applyTheme(themes[0])
 	u := textinput.New()
 	u.Placeholder = "https://httpbin.org/get   (try {{NAME}} for env variables)"
 	u.CharLimit = 4096
@@ -667,14 +776,16 @@ func initialModel() model {
 	sp.Style = lipgloss.NewStyle().Foreground(colAccent)
 
 	m := model{
-		focus:       fURL,
-		compactPane: fResponse,
-		url:         u,
-		headers:     h,
-		body:        b,
-		view:        vp,
-		spin:        sp,
-		hist:        loadHistory(),
+		focus:         fURL,
+		compactPane:   fResponse,
+		url:           u,
+		headers:       h,
+		body:          b,
+		view:          vp,
+		spin:          sp,
+		hist:          loadHistory(),
+		projects:      loadProjects(),
+		activeProject: -1,
 	}
 	return m.applyFocus()
 }
@@ -744,6 +855,25 @@ func (m model) fixScroll(visible int) model {
 	return m
 }
 
+func (m model) fixProjectScroll(visible int) model {
+	if len(m.projects) == 0 {
+		m.projectSel, m.projectTop = 0, 0
+		return m
+	}
+	m.projectSel = min(max(m.projectSel, 0), len(m.projects)-1)
+	if visible < 1 {
+		return m
+	}
+	if m.projectSel < m.projectTop {
+		m.projectTop = m.projectSel
+	}
+	if m.projectSel >= m.projectTop+visible {
+		m.projectTop = m.projectSel - visible + 1
+	}
+	m.projectTop = min(max(m.projectTop, 0), max(len(m.projects)-visible, 0))
+	return m
+}
+
 // ───────────────────────────── actions ─────────────────────────────
 
 func (m model) notify(text string, isErr bool) (model, tea.Cmd) {
@@ -801,6 +931,80 @@ func (m model) loadSelected() (model, tea.Cmd) {
 	m = m.loadEntry(m.hist[m.histSel])
 	m.overlay = ovNone
 	return m, nil
+}
+
+func projectNameFor(e entry) string {
+	u, err := normalizeURL(e.URL)
+	if err == nil {
+		if p, err := url.Parse(u); err == nil && p.Hostname() != "" {
+			return p.Hostname()
+		}
+	}
+	return "Untitled project"
+}
+
+func (m model) projectTitle() string {
+	if m.activeProject >= 0 && m.activeProject < len(m.projects) {
+		return m.projects[m.activeProject].Name
+	}
+	return "Scratchpad"
+}
+
+func (m model) createProject() (model, tea.Cmd) {
+	e := m.currentEntry()
+	p := project{Name: projectNameFor(e), Updated: time.Now()}
+	if e.URL != "" {
+		p.Requests = []entry{e}
+	}
+	m.projects = append(m.projects, p)
+	m.activeProject, m.projectSel = len(m.projects)-1, len(m.projects)-1
+	_ = saveProjects(m.projects)
+	return m.notify("created project “"+p.Name+"”", false)
+}
+
+func (m model) saveToProject() (model, tea.Cmd) {
+	if m.activeProject < 0 || m.activeProject >= len(m.projects) {
+		return m.notify("create or open a project first", true)
+	}
+	e := m.currentEntry()
+	if e.URL == "" {
+		return m.notify("enter a URL first", true)
+	}
+	p := &m.projects[m.activeProject]
+	if i := indexOfKey(p.Requests, e.key()); i >= 0 {
+		p.Requests[i] = e
+	} else {
+		p.Requests = append([]entry{e}, p.Requests...)
+	}
+	p.Updated = time.Now()
+	_ = saveProjects(m.projects)
+	return m.notify("saved to “"+p.Name+"”", false)
+}
+
+func (m model) openProject(i int) (model, tea.Cmd) {
+	if i < 0 || i >= len(m.projects) {
+		return m, nil
+	}
+	m.activeProject, m.projectSel, m.overlay = i, i, ovNone
+	if len(m.projects[i].Requests) > 0 {
+		m = m.loadEntry(m.projects[i].Requests[0])
+	}
+	return m.notify("opened “"+m.projects[i].Name+"”", false)
+}
+
+func (m model) cyclePanes() (model, tea.Cmd) {
+	if m.width < fullW || m.height < fullH {
+		return m.notify("resize for pane focus mode", true)
+	}
+	m.paneMode = (m.paneMode + 1) % 3
+	if m.paneMode == 1 {
+		m.focus = fResponse
+	} else if m.paneMode == 2 {
+		m.focus = fHeaders
+	}
+	m = m.applyFocus().layout()
+	labels := []string{"split panes", "response focus", "request focus"}
+	return m.notify(labels[m.paneMode], false)
 }
 
 func (m model) pinCurrent() (model, tea.Cmd) {
@@ -899,6 +1103,14 @@ func (m model) do(id string) (model, tea.Cmd) {
 		m.overlay = ovHistory
 		m.histSel, m.histTop = 0, 0
 		return m, nil
+	case "projects":
+		m.overlay, m.projectSel, m.projectTop = ovProjects, max(m.activeProject, 0), 0
+		return m.fixProjectScroll(m.geo().visible), nil
+	case "themes":
+		m.overlay = ovThemes
+		return m, nil
+	case "panes":
+		return m.cyclePanes()
 	case "help":
 		m.overlay = ovHelp
 		return m, nil
@@ -1032,7 +1244,7 @@ func (m model) globalKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 	case "shift+tab":
 		m.focus = (m.focus + fCount - 1) % fCount
 		return m.applyFocus(), nil, true
-	case "f5", "ctrl+r":
+	case "f5", "ctrl+r", "ctrl+enter":
 		nm, c := m.do("send")
 		return nm, c, true
 	case "f1":
@@ -1040,6 +1252,15 @@ func (m model) globalKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 		return nm, c, true
 	case "f2", "ctrl+o":
 		nm, c := m.do("hist")
+		return nm, c, true
+	case "ctrl+p":
+		nm, c := m.do("projects")
+		return nm, c, true
+	case "ctrl+g":
+		nm, c := m.do("themes")
+		return nm, c, true
+	case "f10":
+		nm, c := m.do("panes")
 		return nm, c, true
 	case "f3":
 		nm, c := m.do("pin")
@@ -1079,6 +1300,57 @@ func (m model) overlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.overlay = ovNone
 		}
 		return m, nil
+	}
+	if m.overlay == ovThemes {
+		switch k {
+		case "esc", "q", "f1", "?":
+			m.overlay = ovNone
+		case "up", "k":
+			m.themeSel = (m.themeSel + len(themes) - 1) % len(themes)
+		case "down", "j":
+			m.themeSel = (m.themeSel + 1) % len(themes)
+		case "enter", " ":
+			applyTheme(themes[m.themeSel])
+			m.overlay = ovNone
+			return m.notify("theme: "+themes[m.themeSel].name, false)
+		}
+		return m, nil
+	}
+	if m.overlay == ovProjects {
+		vis := m.geo().visible
+		switch k {
+		case "esc", "q", "f2", "ctrl+o":
+			m.overlay = ovNone
+		case "up", "k":
+			m.projectSel--
+		case "down", "j":
+			m.projectSel++
+		case "pgup":
+			m.projectSel -= vis
+		case "pgdown":
+			m.projectSel += vis
+		case "home", "g":
+			m.projectSel = 0
+		case "end", "G":
+			m.projectSel = len(m.projects) - 1
+		case "n":
+			return m.createProject()
+		case "s":
+			return m.saveToProject()
+		case "enter":
+			return m.openProject(m.projectSel)
+		case "d", "delete", "x":
+			if m.projectSel >= 0 && m.projectSel < len(m.projects) {
+				m.projects = slices.Delete(m.projects, m.projectSel, m.projectSel+1)
+				if m.activeProject == m.projectSel {
+					m.activeProject = -1
+				} else if m.activeProject > m.projectSel {
+					m.activeProject--
+				}
+				_ = saveProjects(m.projects)
+			}
+		}
+		return m.fixProjectScroll(vis), nil
 	}
 
 	vis := m.geo().visible
@@ -1136,6 +1408,9 @@ func (m model) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		case m.overlay == ovHistory:
 			m.histSel += step
 			return m.fixScroll(g.visible), nil
+		case m.overlay == ovProjects:
+			m.projectSel += step
+			return m.fixProjectScroll(g.visible), nil
 		case m.overlay != ovNone:
 		case !g.compact && g.resp.in(x, y), g.compact && m.activePane() == fResponse && g.pane.in(x, y):
 			if step < 0 {
@@ -1163,6 +1438,30 @@ func (m model) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				return m.loadSelected()
 			}
 			return m, nil
+		}
+		if !g.modal.in(x, y) {
+			m.overlay = ovNone
+		}
+		return m, nil
+	case ovProjects:
+		if g.items.in(x, y) {
+			if idx := m.projectTop + (y - g.items.y); idx < len(m.projects) {
+				return m.openProject(idx)
+			}
+			return m, nil
+		}
+		if !g.modal.in(x, y) {
+			m.overlay = ovNone
+		}
+		return m, nil
+	case ovThemes:
+		if g.items.in(x, y) {
+			if idx := y - g.items.y; idx < len(themes) {
+				m.themeSel = idx
+				applyTheme(themes[idx])
+				m.overlay = ovNone
+				return m.notify("theme: "+themes[idx].name, false)
+			}
 		}
 		if !g.modal.in(x, y) {
 			m.overlay = ovNone
@@ -1487,6 +1786,18 @@ func (m model) renderBody(g geometry) string {
 	}
 
 	if !g.compact {
+		// Pane focus mode acts like a collapsible workbench: the other side is
+		// removed from the layout, not merely hidden behind a narrow border.
+		if m.paneMode == 1 {
+			title := tab(" Body ", !m.showHeaders) + " " + tab(" Headers ", m.showHeaders) + "  " + m.respStatus(g.resp.w-22)
+			return paneBox(g.resp, m.focus == fResponse, title, m.view.View())
+		}
+		if m.paneMode == 2 {
+			headers := paneBox(g.headers, m.focus == fHeaders,
+				titleStyle.Render("Headers")+dimStyle.Render("  Name: value, one per line"), m.headers.View())
+			body := paneBox(g.body, m.focus == fBody, bodyTitle, m.body.View())
+			return lipgloss.JoinVertical(lipgloss.Left, headers, body)
+		}
 		headers := paneBox(g.headers, m.focus == fHeaders,
 			titleStyle.Render("Headers")+dimStyle.Render("  Name: value, one per line"), m.headers.View())
 		body := paneBox(g.body, m.focus == fBody, bodyTitle, m.body.View())
@@ -1531,7 +1842,7 @@ func (m model) renderStatusLine(g geometry) string {
 	case g.compact && (m.resp != nil || m.loading):
 		s = " " + m.respStatus(g.W-1)
 	default:
-		s = dimStyle.Render(" tab pane · enter send · esc cancel · F2 history · F1 help · ctrl+q quit")
+		s = dimStyle.Render(" " + m.projectTitle() + " · tab pane · ctrl+enter send · F10 panes · ctrl+p projects · ctrl+g theme")
 	}
 	return fit(s, g.W)
 }
@@ -1542,6 +1853,7 @@ var helpLines = []string{
 	titleStyle.Render("Keys"),
 	"tab / shift+tab   next / previous pane",
 	"enter (URL bar)   send · F5 / ctrl+r also send",
+	"ctrl+enter        send from any editor pane",
 	"esc               cancel a running request",
 	"← →  (method)     change method",
 	"F8 / ctrl+t       response body ⇆ headers",
@@ -1550,6 +1862,9 @@ var helpLines = []string{
 	"F3                pin / unpin this request",
 	"F4  F6  F7        copy response · copy cURL · save",
 	"F9                format JSON body",
+	"F10               cycle split / response / request panes",
+	"ctrl+p            projects (n new · s save · enter open)",
+	"ctrl+g            theme picker",
 	"ctrl+q            quit",
 	"",
 	titleStyle.Render("Mouse"),
@@ -1591,6 +1906,40 @@ func (m model) renderOverlay(g geometry) string {
 			row := lipgloss.NewStyle().Foreground(colYellow).Render(mark) + " " +
 				lipgloss.NewStyle().Foreground(mc).Render(fmt.Sprintf("%-7s", e.Method)) + " " + e.URL
 			lines = append(lines, clip(row, inner))
+		}
+	case ovProjects:
+		lines = append(lines,
+			clip(titleStyle.Render("Projects")+dimStyle.Render(fmt.Sprintf("  %d collections · active: %s", len(m.projects), m.projectTitle())), inner),
+			clip(dimStyle.Render("enter open · n new from request · s save request · d delete · esc close"), inner), "")
+		if len(m.projects) == 0 {
+			lines = append(lines, dimStyle.Render("No projects yet. Press n to create one from this request."))
+		}
+		for i := 0; i < g.visible && m.projectTop+i < len(m.projects); i++ {
+			idx, p := m.projectTop+i, m.projects[m.projectTop+i]
+			plain := fmt.Sprintf("%-24s  %d request(s)", p.Name, len(p.Requests))
+			if idx == m.activeProject {
+				plain = "● " + plain
+			} else {
+				plain = "  " + plain
+			}
+			if idx == m.projectSel {
+				lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(colText).Background(colAccent).Width(inner).MaxWidth(inner).Render(plain))
+			} else {
+				lines = append(lines, clip(plain, inner))
+			}
+		}
+	case ovThemes:
+		lines = append(lines, clip(titleStyle.Render("Themes"), inner), clip(dimStyle.Render("↑/↓ choose · enter apply · esc close"), inner), "")
+		for i, t := range themes {
+			swatch := lipgloss.NewStyle().Foreground(lipgloss.Color(t.accent)).Render("■■") + " " +
+				lipgloss.NewStyle().Foreground(lipgloss.Color(t.green)).Render("■■") + " " +
+				lipgloss.NewStyle().Foreground(lipgloss.Color(t.yellow)).Render("■■")
+			row := fmt.Sprintf("  %-10s %s", t.name, swatch)
+			if i == m.themeSel {
+				lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(colText).Background(colAccent).Width(inner).MaxWidth(inner).Render(row))
+			} else {
+				lines = append(lines, row)
+			}
 		}
 	default:
 		for _, l := range helpLines {
