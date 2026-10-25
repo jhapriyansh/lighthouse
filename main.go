@@ -1371,7 +1371,10 @@ func (m model) globalKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 	case "f10":
 		nm, c := m.do("panes")
 		return nm, c, true
-	case "ctrl+space":
+	// Terminals encode Ctrl+Space as NUL, which Bubble Tea reports as ctrl+@.
+	// Keep the spelling variant as a harmless fallback for terminal emulators
+	// that expose it directly.
+	case "ctrl+@", "ctrl+space", "alt+enter":
 		if m.focus == fHeaders {
 			nm, c := m.completeHeader()
 			return nm, c, true
@@ -1986,7 +1989,7 @@ var helpLines = []string{
 	"F10               cycle split / response / request panes",
 	"ctrl+p            projects (n new · s save · enter open)",
 	"ctrl+g            theme picker",
-	"ctrl+space        complete a header name (Headers editor)",
+	"ctrl+@            complete a header name (Ctrl+Space; Alt+Enter also works)",
 	"ctrl+q            quit",
 	"",
 	titleStyle.Render("Mouse"),

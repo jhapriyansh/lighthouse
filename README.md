@@ -43,7 +43,7 @@ File attachments are sent as `multipart/form-data`. If a body is also present, i
 
 ### Header completion and safe paste
 
-In the Headers editor, start typing a standard header name and press `Ctrl+Space` to complete it. Common request headers including `Accept`, `Authorization`, `Content-Type`, and `X-API-Key` are included.
+In the Headers editor, start typing a standard header name on a new line and press `Ctrl+Space` to complete it. Most terminals report that combination as `Ctrl+@`; `Alt+Enter` is provided as an equivalent fallback. Common request headers including `Accept`, `Authorization`, `Content-Type`, and `X-API-Key` are included.
 
 Pasted input is normalized to prevent common terminal/request mistakes: Windows line endings, non-breaking spaces, zero-width characters, and typographic quotes are cleaned in URL, header, body, and upload fields.
 
