@@ -4,7 +4,8 @@
 
 ## Why lh
 
-- Compose requests with a method picker, URL, headers, body, and an optional multipart file attachment.
+- Compose requests with a method picker plus structured Params, Auth, Headers, Body, and Files sections.
+- Switch persistent named environments without exposing their values in the picker.
 - Keep related requests in persistent projects; history remains a separate activity log.
 - Switch among eight considered themes, including three light palettes and five dark palettes.
 - Focus the request form or response pane when you need room, or use the split workbench.
@@ -34,10 +35,11 @@ The top request form is deliberately compact:
 
 1. Choose a method with the arrow controls.
 2. Enter a URL. A missing scheme becomes `https://` automatically; local addresses use `http://`.
-3. Add one header per line as `Name: value`.
-4. Write a body, then press `F9` to format JSON.
-5. Optionally attach a file as `field=@/absolute/path/to/file`.
-6. Press `Enter` in the URL field, `Ctrl+Enter` anywhere, or `F5` to send.
+3. Use the **Params** section for `name=value` pairs; each becomes a safely encoded query parameter.
+4. Use **Auth** for `Bearer {{TOKEN}}` or a bare token (which becomes a Bearer token).
+5. Add one header per line as `Name: value`, write a body, and press `F9` to format JSON.
+6. Use **Files** to attach `field=@/absolute/path/to/file`.
+7. Press `Enter` in the URL field, `Ctrl+Enter` anywhere, or `F5` to send.
 
 File attachments are sent as `multipart/form-data`. If a body is also present, it is included as a multipart field named `payload`. The generated cURL command represents attachments with `-F`.
 
@@ -59,8 +61,9 @@ Projects store reusable request definitions; history is a global chronological l
 | Open a project | `Enter` in Projects |
 | Open history | `F2` / `Ctrl+O` |
 | Pin current request | `F3` |
+| Open environments | `Ctrl+E` |
 
-Use `{{NAME}}` anywhere in a URL, header, body, or upload field to read an environment variable when sending:
+Open the environment manager with `Ctrl+E`. Press `n` to create one, `e` to edit it, and `Enter` to activate it. In the editor, set the first line as `# name: Staging`, add `NAME=value` lines, then press `Ctrl+S` to save. Values stay masked in the environment list. `{{NAME}}` resolves from the selected environment first, then from the process environment:
 
 ```text
 URL:           {{API_HOST}}/v1/assets
@@ -68,7 +71,7 @@ Authorization: Bearer {{API_TOKEN}}
 Upload:        image=@{{HOME}}/Pictures/logo.png
 ```
 
-Request history and projects retain the template text—not expanded secret values. Set `LH_HISTORY_FILE` or `LH_PROJECTS_FILE` to choose their locations.
+Request history and projects retain template text—not expanded secret values. Set `LH_HISTORY_FILE`, `LH_PROJECTS_FILE`, or `LH_ENVIRONMENTS_FILE` to choose their locations.
 
 ## Workbench controls
 
@@ -100,5 +103,6 @@ By default, lh writes private JSON files to your OS configuration directory:
 | --- | --- |
 | History | `lh/history.json` |
 | Projects | `lh/projects.json` |
+| Environments | `lh/environments.json` |
 
 The app is built with Bubble Tea, Bubbles, and Lip Gloss.

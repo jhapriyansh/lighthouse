@@ -48,6 +48,8 @@ const (
 const (
 	fMethod = iota
 	fURL
+	fParams
+	fAuth
 	fHeaders
 	fBody
 	fResponse
@@ -62,6 +64,8 @@ const (
 	ovHelp
 	ovProjects
 	ovThemes
+	ovEnvironments
+	ovEnvEdit
 )
 
 var methods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
@@ -204,7 +208,8 @@ type geometry struct {
 	toolbar []btn // row 0, right-aligned
 
 	selPrev, selName, selNext   rect // method selector
-	urlBar, urlIn, fileIn, send rect
+	urlBar, urlIn, formIn, send rect
+	formTabs                    []btn
 
 	headers, body, resp rect // full layout panes
 	pane                rect // compact layout: the single visible pane
@@ -223,6 +228,7 @@ type geometry struct {
 type toolDef struct{ id, long, short string }
 
 var toolDefs = []toolDef{
+	{"env", "Environment", "Env"},
 	{"projects", "Projects", "Proj"},
 	{"themes", "Theme", "Theme"},
 	{"panes", "Panes", "Pane"},
@@ -255,7 +261,7 @@ func (m model) geo() geometry {
 	useLong := W >= 110
 	defs := toolDefs
 	if W < 70 {
-		defs = []toolDef{toolDefs[0], toolDefs[2], toolDefs[3], toolDefs[len(toolDefs)-1]}
+		defs = []toolDef{toolDefs[0], toolDefs[1], toolDefs[3], toolDefs[len(toolDefs)-1]}
 	}
 	labels := make([]string, len(defs))
 	total := len(defs) - 1
@@ -282,7 +288,12 @@ func (m model) geo() geometry {
 	g.selNext = rect{11, 2, 2, 1}
 	g.urlIn = rect{14, 2, inW, 1}
 	g.send = rect{14 + inW + 1, 2, sendW, 1}
-	g.fileIn = rect{14, 3, W - 16, 1}
+	g.formTabs = []btn{
+		{"params", "Params", rect{3, 3, 8, 1}},
+		{"auth", "Auth", rect{12, 3, 6, 1}},
+		{"files", "Files", rect{19, 3, 7, 1}},
+	}
+	g.formIn = rect{27, 3, W - 29, 1}
 
 	// Body area: rows 4 .. H-2. Row H-1 is the status line.
 	top := 5
@@ -327,13 +338,16 @@ func (m model) geo() geometry {
 	// Overlay modal.
 	bw := min(W-4, 90)
 	switch m.overlay {
-	case ovHistory, ovProjects, ovThemes:
+	case ovHistory, ovProjects, ovThemes, ovEnvironments:
 		count := len(m.hist)
 		if m.overlay == ovProjects {
 			count = len(m.projects)
 		}
 		if m.overlay == ovThemes {
 			count = len(themes)
+		}
+		if m.overlay == ovEnvironments {
+			count = len(m.environments)
 		}
 		vis := min(max(count, 1), H-2-7)
 		mh := vis + 7
@@ -343,6 +357,9 @@ func (m model) geo() geometry {
 	case ovHelp:
 		mh := min(len(helpLines)+4, H-2)
 		g.modal = rect{(W - bw) / 2, 1 + (H-2-mh)/2, bw, mh}
+	case ovEnvEdit:
+		mh := max(10, H-4)
+		g.modal = rect{(W - bw) / 2, 2, bw, mh}
 	}
 	return g
 }
@@ -352,6 +369,8 @@ func (m model) geo() geometry {
 type entry struct {
 	Method  string    `json:"method"`
 	URL     string    `json:"url"`
+	Params  string    `json:"params,omitempty"`
+	Auth    string    `json:"auth,omitempty"`
 	Headers string    `json:"headers"`
 	Body    string    `json:"body"`
 	File    string    `json:"file,omitempty"`
@@ -369,7 +388,12 @@ type project struct {
 }
 
 func (e entry) key() string {
-	return e.Method + "\x00" + e.URL + "\x00" + e.Headers + "\x00" + e.Body + "\x00" + e.File
+	return e.Method + "\x00" + e.URL + "\x00" + e.Params + "\x00" + e.Auth + "\x00" + e.Headers + "\x00" + e.Body + "\x00" + e.File
+}
+
+type environment struct {
+	Name   string            `json:"name"`
+	Values map[string]string `json:"values"`
 }
 
 func indexOfKey(list []entry, k string) int {
@@ -516,6 +540,52 @@ func saveProjects(list []project) error {
 	return os.Rename(tmp, p)
 }
 
+func environmentsPath() (string, error) {
+	if p := os.Getenv("LH_ENVIRONMENTS_FILE"); p != "" {
+		return p, nil
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "lh", "environments.json"), nil
+}
+
+func loadEnvironments() []environment {
+	p, err := environmentsPath()
+	if err != nil {
+		return nil
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var list []environment
+	if json.Unmarshal(b, &list) != nil {
+		return nil
+	}
+	return list
+}
+
+func saveEnvironments(list []environment) error {
+	p, err := environmentsPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p)
+}
+
 // ───────────────────────────── request building ─────────────────────────────
 
 type reqSpec struct {
@@ -531,9 +601,16 @@ var varRe = regexp.MustCompile(`\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}`)
 
 // expandVars replaces {{NAME}} with the environment variable NAME.
 func expandVars(s string) (string, []string) {
+	return expandVarsWith(s, nil)
+}
+
+func expandVarsWith(s string, values map[string]string) (string, []string) {
 	var missing []string
 	out := varRe.ReplaceAllStringFunc(s, func(tok string) string {
 		name := varRe.FindStringSubmatch(tok)[1]
+		if v, ok := values[name]; ok {
+			return v
+		}
 		v, ok := os.LookupEnv(name)
 		if !ok {
 			missing = append(missing, name)
@@ -542,6 +619,22 @@ func expandVars(s string) (string, []string) {
 		return v
 	})
 	return out, missing
+}
+
+func parseParams(raw string) (url.Values, error) {
+	q := url.Values{}
+	for _, line := range strings.FieldsFunc(raw, func(r rune) bool { return r == '\n' || r == '&' }) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(k) == "" {
+			return nil, fmt.Errorf("parameter format: name=value")
+		}
+		q.Add(strings.TrimSpace(k), strings.TrimSpace(v))
+	}
+	return q, nil
 }
 
 // normalizeURL adds a scheme if missing: http for local hosts, https otherwise.
@@ -622,6 +715,8 @@ func (m model) currentEntry() entry {
 	return entry{
 		Method:  methods[m.method],
 		URL:     strings.TrimSpace(m.url.Value()),
+		Params:  m.params.Value(),
+		Auth:    m.auth.Value(),
 		Headers: m.headers.Value(),
 		Body:    m.body.Value(),
 		File:    m.file.Value(),
@@ -632,8 +727,12 @@ func (m model) currentEntry() entry {
 // spec turns the form into a ready-to-send request (variables expanded).
 func (m model) spec() (reqSpec, error) {
 	var missing []string
+	values := map[string]string(nil)
+	if m.activeEnvironment >= 0 && m.activeEnvironment < len(m.environments) {
+		values = m.environments[m.activeEnvironment].Values
+	}
 	ex := func(s string) string {
-		out, miss := expandVars(s)
+		out, miss := expandVarsWith(s, values)
 		missing = append(missing, miss...)
 		return out
 	}
@@ -641,7 +740,8 @@ func (m model) spec() (reqSpec, error) {
 	if raw == "" {
 		return reqSpec{}, errors.New("enter a URL first")
 	}
-	target, hdrs, body, file := ex(raw), ex(m.headers.Value()), ex(m.body.Value()), ex(m.file.Value())
+	target, params, auth := ex(raw), ex(m.params.Value()), ex(m.auth.Value())
+	hdrs, body, file := ex(m.headers.Value()), ex(m.body.Value()), ex(m.file.Value())
 	if len(missing) > 0 {
 		return reqSpec{}, fmt.Errorf("undefined variable: %s", strings.Join(uniq(missing), ", "))
 	}
@@ -649,9 +749,31 @@ func (m model) spec() (reqSpec, error) {
 	if err != nil {
 		return reqSpec{}, err
 	}
+	pu, err := url.Parse(target)
+	if err != nil {
+		return reqSpec{}, err
+	}
+	q, err := parseParams(params)
+	if err != nil {
+		return reqSpec{}, err
+	}
+	existing := pu.Query()
+	for k, vs := range q {
+		for _, v := range vs {
+			existing.Add(k, v)
+		}
+	}
+	pu.RawQuery, target = existing.Encode(), pu.String()
 
 	method := methods[m.method]
 	h := parseHeaders(hdrs)
+	if auth != "" && h.Get("Authorization") == "" {
+		if strings.HasPrefix(strings.ToLower(auth), "bearer ") || strings.HasPrefix(strings.ToLower(auth), "basic ") {
+			h.Set("Authorization", auth)
+		} else {
+			h.Set("Authorization", "Bearer "+auth)
+		}
+	}
 	if method == "GET" || method == "HEAD" {
 		body = ""
 	}
@@ -800,9 +922,12 @@ type toastMsg struct{ id int }
 type model struct {
 	method      int
 	focus       int
-	compactPane int // which pane the compact layout shows when URL/method has focus
+	compactPane int    // which pane the compact layout shows when URL/method has focus
+	formTab     string // params, auth, or files
 
 	url     textinput.Model
+	params  textinput.Model
+	auth    textinput.Model
 	file    textinput.Model
 	headers textarea.Model
 	body    textarea.Model
@@ -814,16 +939,21 @@ type model struct {
 	cancel      context.CancelFunc
 	showHeaders bool // response pane: body or headers
 
-	overlay       int
-	hist          []entry
-	histSel       int
-	histTop       int
-	projects      []project
-	projectSel    int
-	projectTop    int
-	activeProject int // -1 is the unsaved scratchpad
-	themeSel      int
-	paneMode      int // 0 split, 1 response focus, 2 request focus (full layout)
+	overlay           int
+	hist              []entry
+	histSel           int
+	histTop           int
+	projects          []project
+	projectSel        int
+	projectTop        int
+	activeProject     int // -1 is the unsaved scratchpad
+	environments      []environment
+	environmentSel    int
+	activeEnvironment int // -1 uses only process variables
+	envEditor         textarea.Model
+	envEditIndex      int
+	themeSel          int
+	paneMode          int // 0 split, 1 response focus, 2 request focus (full layout)
 
 	toast    string
 	toastErr bool
@@ -838,6 +968,14 @@ func initialModel() model {
 	u.Placeholder = "https://httpbin.org/get   (try {{NAME}} for env variables)"
 	u.CharLimit = 4096
 	u.Prompt = ""
+	p := textinput.New()
+	p.Placeholder = "name=value  (use & or new lines for more)"
+	p.CharLimit = 4096
+	p.Prompt = ""
+	a := textinput.New()
+	a.Placeholder = "Bearer {{TOKEN}}  (stored as a template)"
+	a.CharLimit = 4096
+	a.Prompt = ""
 	f := textinput.New()
 	f.Placeholder = "optional upload: field=@/absolute/path/to/file"
 	f.CharLimit = 4096
@@ -855,6 +993,11 @@ func initialModel() model {
 	b.ShowLineNumbers = false
 	b.Prompt = ""
 	b.CharLimit = 0
+	e := textarea.New()
+	e.Placeholder = "API_HOST=https://api.example.com\nAPI_TOKEN=secret"
+	e.ShowLineNumbers = false
+	e.Prompt = ""
+	e.CharLimit = 0
 
 	vp := viewport.New(40, 10)
 	vp.SetContent(dimStyle.Render("Press enter in the URL bar, click Send, or hit F5."))
@@ -864,17 +1007,23 @@ func initialModel() model {
 	sp.Style = lipgloss.NewStyle().Foreground(colAccent)
 
 	m := model{
-		focus:         fURL,
-		compactPane:   fResponse,
-		url:           u,
-		file:          f,
-		headers:       h,
-		body:          b,
-		view:          vp,
-		spin:          sp,
-		hist:          loadHistory(),
-		projects:      loadProjects(),
-		activeProject: -1,
+		focus:             fURL,
+		compactPane:       fResponse,
+		formTab:           "params",
+		url:               u,
+		params:            p,
+		auth:              a,
+		file:              f,
+		headers:           h,
+		body:              b,
+		view:              vp,
+		spin:              sp,
+		hist:              loadHistory(),
+		projects:          loadProjects(),
+		activeProject:     -1,
+		environments:      loadEnvironments(),
+		activeEnvironment: -1,
+		envEditor:         e,
 	}
 	return m.applyFocus()
 }
@@ -882,6 +1031,8 @@ func initialModel() model {
 // applyFocus makes exactly one input live (cursor, receives keys).
 func (m model) applyFocus() model {
 	m.url.Blur()
+	m.params.Blur()
+	m.auth.Blur()
 	m.file.Blur()
 	m.headers.Blur()
 	m.body.Blur()
@@ -898,6 +1049,13 @@ func (m model) applyFocus() model {
 		m.compactPane = fResponse
 	case fFile:
 		m.file.Focus()
+		m.formTab = "files"
+	case fParams:
+		m.params.Focus()
+		m.formTab = "params"
+	case fAuth:
+		m.auth.Focus()
+		m.formTab = "auth"
 	}
 	return m
 }
@@ -909,7 +1067,9 @@ func (m model) layout() model {
 		return m
 	}
 	m.url.Width = max(g.urlIn.w-1, 1)
-	m.file.Width = max(g.fileIn.w-1, 1)
+	m.params.Width = max(g.formIn.w-1, 1)
+	m.auth.Width = max(g.formIn.w-1, 1)
+	m.file.Width = max(g.formIn.w-1, 1)
 	m.file.SetCursor(m.file.Position())
 	m.url.SetCursor(m.url.Position()) // re-scroll so the cursor stays visible
 	m.headers.SetWidth(max(g.taW, 10))
@@ -1012,6 +1172,8 @@ func (m model) loadEntry(e entry) model {
 		m.method = i
 	}
 	m.url.SetValue(e.URL)
+	m.params.SetValue(e.Params)
+	m.auth.SetValue(e.Auth)
 	m.headers.SetValue(e.Headers)
 	m.body.SetValue(e.Body)
 	m.file.SetValue(e.File)
@@ -1043,6 +1205,87 @@ func (m model) projectTitle() string {
 		return m.projects[m.activeProject].Name
 	}
 	return "Scratchpad"
+}
+
+func (m model) environmentTitle() string {
+	if m.activeEnvironment >= 0 && m.activeEnvironment < len(m.environments) {
+		return m.environments[m.activeEnvironment].Name
+	}
+	return "No environment"
+}
+
+func envText(name string, values map[string]string) string {
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	lines := []string{"# name: " + name}
+	for _, k := range keys {
+		lines = append(lines, k+"="+values[k])
+	}
+	return strings.Join(lines, "\n")
+}
+
+func parseEnvText(raw string) (string, map[string]string, error) {
+	values := map[string]string{}
+	name := ""
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(line), "# name:") {
+			name = strings.TrimSpace(line[len("# name:"):])
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(k) == "" {
+			return "", nil, fmt.Errorf("environment format: NAME=value")
+		}
+		values[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	return name, values, nil
+}
+
+func (m model) openEnvironmentEditor(i int) model {
+	if i < 0 || i >= len(m.environments) {
+		return m
+	}
+	m.envEditIndex, m.overlay = i, ovEnvEdit
+	m.envEditor.SetValue(envText(m.environments[i].Name, m.environments[i].Values))
+	m.envEditor.SetWidth(max(m.width-10, 10))
+	m.envEditor.SetHeight(max(m.height-8, 3))
+	m.envEditor.Focus()
+	return m
+}
+
+func (m model) saveEnvironmentEditor() (model, tea.Cmd) {
+	name, values, err := parseEnvText(m.envEditor.Value())
+	if err != nil {
+		return m.notify(err.Error(), true)
+	}
+	if m.envEditIndex < 0 || m.envEditIndex >= len(m.environments) {
+		return m.notify("environment not found", true)
+	}
+	if name != "" {
+		m.environments[m.envEditIndex].Name = name
+	}
+	m.environments[m.envEditIndex].Values = values
+	_ = saveEnvironments(m.environments)
+	m.activeEnvironment, m.environmentSel, m.overlay = m.envEditIndex, m.envEditIndex, ovNone
+	return m.notify("saved environment “"+m.environments[m.envEditIndex].Name+"”", false)
+}
+
+func (m model) createEnvironment() model {
+	name := fmt.Sprintf("Environment %d", len(m.environments)+1)
+	m.environments = append(m.environments, environment{Name: name, Values: map[string]string{}})
+	m.environmentSel, m.activeEnvironment = len(m.environments)-1, len(m.environments)-1
+	_ = saveEnvironments(m.environments)
+	return m.openEnvironmentEditor(len(m.environments) - 1)
 }
 
 func (m model) createProject() (model, tea.Cmd) {
@@ -1198,6 +1441,9 @@ func (m model) do(id string) (model, tea.Cmd) {
 		m.overlay = ovHistory
 		m.histSel, m.histTop = 0, 0
 		return m, nil
+	case "env":
+		m.overlay, m.environmentSel = ovEnvironments, max(m.activeEnvironment, 0)
+		return m, nil
 	case "projects":
 		m.overlay, m.projectSel, m.projectTop = ovProjects, max(m.activeProject, 0), 0
 		return m.fixProjectScroll(m.geo().visible), nil
@@ -1317,6 +1563,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if clean := cleanPaste(m.url.Value()); clean != m.url.Value() {
 			m.url.SetValue(clean)
 		}
+	case fParams:
+		m.params, cmd = m.params.Update(msg)
+		if clean := cleanPaste(m.params.Value()); clean != m.params.Value() {
+			m.params.SetValue(clean)
+		}
+	case fAuth:
+		m.auth, cmd = m.auth.Update(msg)
+		if clean := cleanPaste(m.auth.Value()); clean != m.auth.Value() {
+			m.auth.SetValue(clean)
+		}
 	case fHeaders:
 		m.headers, cmd = m.headers.Update(msg)
 		if clean := cleanPaste(m.headers.Value()); clean != m.headers.Value() {
@@ -1364,6 +1620,9 @@ func (m model) globalKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 		return nm, c, true
 	case "ctrl+p":
 		nm, c := m.do("projects")
+		return nm, c, true
+	case "ctrl+e":
+		nm, c := m.do("env")
 		return nm, c, true
 	case "ctrl+g":
 		nm, c := m.do("themes")
@@ -1415,6 +1674,56 @@ func (m model) overlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch k {
 		case "esc", "q", "?", "f1", "enter", " ":
 			m.overlay = ovNone
+		}
+		return m, nil
+	}
+	if m.overlay == ovEnvEdit {
+		switch k {
+		case "esc":
+			m.overlay = ovEnvironments
+			m.envEditor.Blur()
+			return m, nil
+		case "ctrl+s":
+			return m.saveEnvironmentEditor()
+		}
+		var cmd tea.Cmd
+		m.envEditor, cmd = m.envEditor.Update(msg)
+		if clean := cleanPaste(m.envEditor.Value()); clean != m.envEditor.Value() {
+			m.envEditor.SetValue(clean)
+		}
+		return m, cmd
+	}
+	if m.overlay == ovEnvironments {
+		switch k {
+		case "esc", "q", "ctrl+e":
+			m.overlay = ovNone
+		case "up", "k":
+			m.environmentSel--
+		case "down", "j":
+			m.environmentSel++
+		case "n":
+			return m.createEnvironment(), nil
+		case "e":
+			return m.openEnvironmentEditor(m.environmentSel), nil
+		case "enter":
+			if m.environmentSel >= 0 && m.environmentSel < len(m.environments) {
+				m.activeEnvironment, m.overlay = m.environmentSel, ovNone
+				return m.notify("environment: "+m.environmentTitle(), false)
+			}
+		case "0":
+			m.activeEnvironment, m.overlay = -1, ovNone
+			return m.notify("environment cleared", false)
+		case "d", "delete", "x":
+			if m.environmentSel >= 0 && m.environmentSel < len(m.environments) {
+				m.environments = slices.Delete(m.environments, m.environmentSel, m.environmentSel+1)
+				if m.activeEnvironment == m.environmentSel {
+					m.activeEnvironment = -1
+				} else if m.activeEnvironment > m.environmentSel {
+					m.activeEnvironment--
+				}
+				m.environmentSel = min(max(m.environmentSel, 0), max(len(m.environments)-1, 0))
+				_ = saveEnvironments(m.environments)
+			}
 		}
 		return m, nil
 	}
@@ -1584,6 +1893,23 @@ func (m model) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			m.overlay = ovNone
 		}
 		return m, nil
+	case ovEnvironments:
+		if g.items.in(x, y) {
+			if idx := y - g.items.y; idx < len(m.environments) {
+				m.activeEnvironment, m.environmentSel, m.overlay = idx, idx, ovNone
+				return m.notify("environment: "+m.environmentTitle(), false)
+			}
+		}
+		if !g.modal.in(x, y) {
+			m.overlay = ovNone
+		}
+		return m, nil
+	case ovEnvEdit:
+		if !g.modal.in(x, y) {
+			m.overlay = ovEnvironments
+			m.envEditor.Blur()
+		}
+		return m, nil
 	}
 
 	// Toolbar.
@@ -1609,11 +1935,26 @@ func (m model) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m = m.applyFocus()
 		m.url.SetCursor(x - g.urlIn.x)
 		return m, nil
-	case g.fileIn.in(x, y):
-		m.focus = fFile
+	case g.formIn.in(x, y):
+		m.focus = map[string]int{"params": fParams, "auth": fAuth, "files": fFile}[m.formTab]
 		m = m.applyFocus()
-		m.file.SetCursor(x - g.fileIn.x)
+		switch m.focus {
+		case fParams:
+			m.params.SetCursor(x - g.formIn.x)
+		case fAuth:
+			m.auth.SetCursor(x - g.formIn.x)
+		case fFile:
+			m.file.SetCursor(x - g.formIn.x)
+		}
 		return m, nil
+	}
+	for _, b := range g.formTabs {
+		if b.r.in(x, y) {
+			m.focus = map[string]int{"params": fParams, "auth": fAuth, "files": fFile}[b.id]
+			return m.applyFocus(), nil
+		}
+	}
+	switch {
 	case g.urlBar.in(x, y):
 		m.focus = fURL
 		return m.applyFocus(), nil
@@ -1856,8 +2197,17 @@ func (m model) renderURLBar(g geometry) string {
 	}
 	line := selector(methods[m.method], m.focus == fMethod) + " " +
 		fit(m.url.View(), g.urlIn.w) + " " + send
-	file := dimStyle.Render("  Upload    ") + fit(m.file.View(), g.fileIn.w)
-	return box(m.focus == fMethod || m.focus == fURL || m.focus == fFile, g.W-2).Render(line + "\n" + file)
+	sections := " " + tab(" Params ", m.formTab == "params") + " " + tab(" Auth ", m.formTab == "auth") + " " + tab(" Files ", m.formTab == "files") + " "
+	var field string
+	switch m.formTab {
+	case "auth":
+		field = m.auth.View()
+	case "files":
+		field = m.file.View()
+	default:
+		field = m.params.View()
+	}
+	return box(m.focus == fMethod || m.focus == fURL || m.focus == fParams || m.focus == fAuth || m.focus == fFile, g.W-2).Render(line + "\n" + sections + fit(field, g.formIn.w))
 }
 
 // paneBox draws a bordered pane of exactly r.w x r.h cells.
@@ -1965,7 +2315,7 @@ func (m model) renderStatusLine(g geometry) string {
 	case g.compact && (m.resp != nil || m.loading):
 		s = " " + m.respStatus(g.W-1)
 	default:
-		s = dimStyle.Render(" " + m.projectTitle() + " · tab pane · ctrl+enter send · F10 panes · ctrl+p projects · ctrl+g theme")
+		s = dimStyle.Render(" " + m.projectTitle() + " · " + m.environmentTitle() + " · ctrl+enter send · ctrl+e env · ctrl+p projects")
 	}
 	return fit(s, g.W)
 }
@@ -1988,6 +2338,7 @@ var helpLines = []string{
 	"F9                format JSON body",
 	"F10               cycle split / response / request panes",
 	"ctrl+p            projects (n new · s save · enter open)",
+	"ctrl+e            environments (n new · e edit · enter select)",
 	"ctrl+g            theme picker",
 	"ctrl+@            complete a header name (Ctrl+Space; Alt+Enter also works)",
 	"ctrl+q            quit",
@@ -1997,8 +2348,8 @@ var helpLines = []string{
 	"toolbar buttons. The wheel scrolls the response.",
 	"",
 	titleStyle.Render("Variables"),
-	"{{NAME}} in the URL, headers or body is replaced",
-	"by the environment variable NAME when you send.",
+	"{{NAME}} in any request field is replaced by the selected",
+	"environment first, then by the process environment.",
 }
 
 func (m model) renderOverlay(g geometry) string {
@@ -2066,6 +2417,30 @@ func (m model) renderOverlay(g geometry) string {
 				lines = append(lines, row)
 			}
 		}
+	case ovEnvironments:
+		lines = append(lines,
+			clip(titleStyle.Render("Environments")+dimStyle.Render("  active: "+m.environmentTitle()), inner),
+			clip(dimStyle.Render("enter select · e edit · n new · 0 clear · d delete · esc close"), inner), "")
+		if len(m.environments) == 0 {
+			lines = append(lines, dimStyle.Render("No environments. Press n to create one."))
+		}
+		for i, env := range m.environments {
+			row := fmt.Sprintf("  %-24s  %d variable(s)", env.Name, len(env.Values))
+			if i == m.activeEnvironment {
+				row = "● " + strings.TrimPrefix(row, "  ")
+			}
+			if i == m.environmentSel {
+				lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(colText).Background(colAccent).Width(inner).MaxWidth(inner).Render(row))
+			} else {
+				lines = append(lines, clip(row, inner))
+			}
+		}
+	case ovEnvEdit:
+		name := "Environment"
+		if m.envEditIndex >= 0 && m.envEditIndex < len(m.environments) {
+			name = m.environments[m.envEditIndex].Name
+		}
+		lines = append(lines, titleStyle.Render("Edit "+name), dimStyle.Render("NAME=value per line · Ctrl+S save · Esc cancel"), "", m.envEditor.View())
 	default:
 		for _, l := range helpLines {
 			lines = append(lines, clip(l, inner))
